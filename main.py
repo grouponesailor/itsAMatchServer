@@ -1,60 +1,25 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Body
 from pymongo import MongoClient
-from typing import List, Optional, Dict, Any
-from pydantic import BaseModel, Field
+from typing import Dict, Any
 from datetime import datetime
 from bson import ObjectId
-
-# Define response models for better Swagger documentation
-class GenericItem(BaseModel):
-    """
-    Represents an item in the generic collection.
-    Add fields based on your actual data structure.
-    """
-    id: Optional[str] = None
-    name: Optional[str] = None
-    description: Optional[str] = None
-    created_at: Optional[str] = None
-    
-    class Config:
-        arbitrary_types_allowed = True
-        json_schema_extra = {
-            "example": {
-                "id": "123",
-                "name": "Sample Item",
-                "description": "This is a sample item",
-                "created_at": "2024-01-01T00:00:00"
-            }
-        }
-
-class Settings(BaseModel):
-    timezone: str = Field(default="UTC")
-    location: str = Field(default="US")
-
-class Preferences(BaseModel):
-    theme: str = Field(default="dark")
-    notifications_enabled: bool = Field(default=True)
-    language: str = Field(default="en")
-
-class UserPreferences(BaseModel):
-    user_id: str
-    preferences: Preferences
-    settings: Settings
-
-    class Config:
-        arbitrary_types_allowed = True
-        json_encoders = {
-            ObjectId: str
-        }
-
-class UserPreferencesUpdate(BaseModel):
-    preferences: Optional[Preferences] = None
-    settings: Optional[Settings] = None
+from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(
     title="ItsAMatch API",
     description="This API provides access to the ItsAMatch database.",
     version="1.0.0"
+)
+
+# Add CORS middleware with explicit configuration
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allows all origins
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD"],  # Explicitly list all allowed methods
+    allow_headers=["*"],  # Allows all headers
+    expose_headers=["*"],  # Expose all headers
+    max_age=86400,  # Cache preflight requests for 24 hours
 )
 
 # MongoDB connection
@@ -69,7 +34,7 @@ except Exception as e:
 
 # Define database and collection
 db = client["ItsAMatch"]
-collection = db["generic"]  # Using the generic collection for user preferences
+collection = db["user_preferences"]  # Using user_preferences collection for all preferences
 
 @app.get("/",
     tags=["General"],
@@ -79,49 +44,71 @@ collection = db["generic"]  # Using the generic collection for user preferences
 async def root():
     return {"message": "Welcome to the ItsAMatch API"}
 
-@app.post("/user/preferences/",
+@app.post("/user/{user_id}/app/{app_id}/preferences",
     tags=["User Preferences"],
-    summary="Create user preferences",
-    description="Create new user preferences",
+    summary="Create app preferences",
+    description="Create new preferences for a specific app for a user. The request body will be stored as-is under the preferences field.",
     response_model=Dict[str, Any]
 )
-async def create_user_preferences(preferences: UserPreferences):
+async def create_app_preferences(
+    user_id: str, 
+    app_id: str, 
+    body: Dict[str, Any] = Body(...)  # Accept any JSON body
+):
     try:
-        # Check if user preferences already exist
-        existing = collection.find_one({"user_id": preferences.user_id})
+        # Check if preferences for this user and app already exist
+        existing = collection.find_one({
+            "user_id": user_id,
+            "app_id": app_id
+        })
+        
         if existing:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Preferences for user {preferences.user_id} already exist"
-            )
+            # If preferences exist, return 200 OK with existing preferences
+            return {k: v for k, v in existing.items() if k != '_id'}
 
-        # Insert new preferences
-        result = collection.insert_one(preferences.dict())
+        # Create new document with metadata and raw body under preferences
+        new_preferences = {
+            "user_id": user_id,
+            "app_id": app_id,
+            "preferences": body,  # Store the entire request body under preferences
+            "created_at": datetime.utcnow().isoformat(),
+            "updated_at": datetime.utcnow().isoformat()
+        }
+
+        # Insert the document
+        result = collection.insert_one(new_preferences)
         
         # Return created document
-        created = collection.find_one({"_id": result.inserted_id}, {"_id": 0})
-        return created
+        created = collection.find_one({"_id": result.inserted_id})
+        return {k: v for k, v in created.items() if k != '_id'}
 
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=500,
-            detail=f"An error occurred while creating preferences: {str(e)}"
+            detail=f"An error occurred while creating app preferences: {str(e)}"
         )
 
-@app.get("/user/preferences/{user_id}",
+@app.get("/user/{user_id}/app/{app_id}/preferences",
     tags=["User Preferences"],
-    summary="Get user preferences",
-    description="Retrieve user preferences by user ID",
+    summary="Get app-specific preferences",
+    description="Retrieve preferences for a specific app for a user",
     response_model=Dict[str, Any]
 )
-async def get_user_preferences(user_id: str):
+async def get_app_preferences(user_id: str, app_id: str):
     try:
-        preferences = collection.find_one({"user_id": user_id}, {"_id": 0})
+        preferences = collection.find_one({
+            "user_id": user_id,
+            "app_id": app_id
+        }, {"_id": 0})
+        
         if not preferences:
             raise HTTPException(
                 status_code=404,
-                detail=f"No preferences found for user {user_id}"
+                detail=f"No preferences found for app {app_id} and user {user_id}"
             )
+            
         return preferences
 
     except HTTPException:
@@ -129,95 +116,104 @@ async def get_user_preferences(user_id: str):
     except Exception as e:
         raise HTTPException(
             status_code=500,
-            detail=f"An error occurred while fetching preferences: {str(e)}"
+            detail=f"An error occurred while fetching app preferences: {str(e)}"
         )
 
-@app.put("/user/preferences/{user_id}",
+@app.put("/user/{user_id}/app/{app_id}/preferences",
     tags=["User Preferences"],
-    summary="Update user preferences",
-    description="Update user preferences by user ID",
+    summary="Update or create app preferences",
+    description="Update preferences for a specific app for a user. If preferences don't exist, creates them. The request body will be stored as-is under the preferences field.",
     response_model=Dict[str, Any]
 )
-async def update_user_preferences(user_id: str, preferences: UserPreferencesUpdate):
+async def update_app_preferences(
+    user_id: str, 
+    app_id: str, 
+    body: Dict[str, Any] = Body(...)  # Accept any JSON body
+):
     try:
         # Check if preferences exist
-        existing = collection.find_one({"user_id": user_id})
+        existing = collection.find_one({
+            "user_id": user_id,
+            "app_id": app_id
+        })
+        
+        # Prepare update data with metadata and raw body under preferences
+        update_data = {
+            "user_id": user_id,
+            "app_id": app_id,
+            "preferences": body,  # Store the entire request body under preferences
+            "updated_at": datetime.utcnow().isoformat()
+        }
+
         if not existing:
-            raise HTTPException(
-                status_code=404,
-                detail=f"No preferences found for user {user_id}"
+            # If document doesn't exist, create it with both created_at and updated_at
+            update_data["created_at"] = update_data["updated_at"]
+            
+            # Insert new document
+            result = collection.insert_one(update_data)
+            
+            # Return created document
+            created = collection.find_one({"_id": result.inserted_id})
+            return {k: v for k, v in created.items() if k != '_id'}
+        else:
+            # Update existing document
+            result = collection.update_one(
+                {
+                    "user_id": user_id,
+                    "app_id": app_id
+                },
+                {"$set": update_data}
             )
 
-        # Prepare update data
-        update_data = {}
-        if preferences.preferences:
-            update_data["preferences"] = preferences.preferences.dict()
-        if preferences.settings:
-            update_data["settings"] = preferences.settings.dict()
+            if result.modified_count == 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Update failed"
+                )
 
-        if not update_data:
-            raise HTTPException(
-                status_code=400,
-                detail="No update data provided"
-            )
-
-        # Update preferences
-        result = collection.update_one(
-            {"user_id": user_id},
-            {"$set": update_data}
-        )
-
-        if result.modified_count == 0:
-            raise HTTPException(
-                status_code=400,
-                detail="Update failed"
-            )
-
-        # Return updated document
-        updated = collection.find_one({"user_id": user_id}, {"_id": 0})
-        return updated
+            # Return updated document
+            updated = collection.find_one({
+                "user_id": user_id,
+                "app_id": app_id
+            })
+            return {k: v for k, v in updated.items() if k != '_id'}
 
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(
             status_code=500,
-            detail=f"An error occurred while updating preferences: {str(e)}"
+            detail=f"An error occurred while updating app preferences: {str(e)}"
         )
 
-@app.delete("/user/preferences/{user_id}",
+@app.delete("/user/{user_id}/app/{app_id}/preferences",
     tags=["User Preferences"],
-    summary="Delete user preferences",
-    description="Delete user preferences by user ID",
+    summary="Delete app preferences",
+    description="Delete preferences for a specific app for a user",
     response_model=Dict[str, str]
 )
-async def delete_user_preferences(user_id: str):
+async def delete_app_preferences(user_id: str, app_id: str):
     try:
-        # Check if preferences exist
-        existing = collection.find_one({"user_id": user_id})
-        if not existing:
-            raise HTTPException(
-                status_code=404,
-                detail=f"No preferences found for user {user_id}"
-            )
+        # Delete app preferences
+        result = collection.delete_one({
+            "user_id": user_id,
+            "app_id": app_id
+        })
 
-        # Delete preferences
-        result = collection.delete_one({"user_id": user_id})
-        
         if result.deleted_count == 0:
             raise HTTPException(
-                status_code=400,
-                detail="Delete failed"
+                status_code=404,
+                detail=f"No preferences found for app {app_id} and user {user_id}"
             )
 
-        return {"message": f"Preferences for user {user_id} deleted successfully"}
+        return {"message": f"Preferences for app {app_id} deleted successfully"}
 
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(
             status_code=500,
-            detail=f"An error occurred while deleting preferences: {str(e)}"
+            detail=f"An error occurred while deleting app preferences: {str(e)}"
         )
 
 @app.get("/test-connection",
@@ -227,43 +223,12 @@ async def delete_user_preferences(user_id: str):
 )
 async def test_connection():
     try:
-        # Test connection
-        db_status = db.command("serverStatus")
-        
-        # Get collection stats
-        stats = db.command("collstats", "generic")
-        
-        return {
-            "connection_string": MONGO_CONNECTION_STRING,
-            "status": "Connected",
-            "database": {
-                "name": "ItsAMatch",
-                "status": "Connected",
-                "collection": "generic",
-                "document_count": collection.count_documents({}),
-                "size": stats.get("size", 0)
-            }
-        }
+        client.admin.command('ping')
+        return {"status": "Connected to MongoDB successfully"}
     except Exception as e:
         raise HTTPException(
             status_code=500,
-            detail=f"MongoDB connection error: {str(e)}"
-        )
-
-@app.get("/generic",
-    tags=["Generic Items"],
-    summary="Get all items",
-    description="Retrieves all items from the generic collection in ItsAMatch database",
-    response_model=List[Dict[str, Any]]
-)
-async def list_generic_items():
-    try:
-        items = list(collection.find({}, {"_id": 0}))
-        return items
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"An error occurred while fetching items: {str(e)}"
+            detail=f"Failed to connect to MongoDB: {str(e)}"
         )
 
 if __name__ == "__main__":
